@@ -1,0 +1,396 @@
+global color_filter_asm
+global distancia
+global min
+
+%define coloresParametro xmm14
+%define threshold xmm15
+%define cantBytesImagen ebx
+%define src rdi
+%define dst rsi
+
+
+
+;------------------------------------------------------------------------------------------------------
+
+;-----------------------------------    MACROS    ------------------------------------------------------
+
+
+
+;------------------------------------------------------------------------------------------------------
+%macro	desempaquetar	3
+
+	pshufb %1, xmm3
+
+	movdqu %2, %1
+	movdqu %3, %1
+
+	punpcklbw %2, xmm5
+	punpckhbw %3, xmm5
+
+	pshufb %2, xmm3
+	pshufb %3, xmm3
+
+	;%2 = B | 0 | G | 0 | R | 0 | 0 | 0 | B | 0 | G | 0 | R | 0 | 0 | 0  (PIXEL 1 Y 2)
+	;%3 = B | 0 | G | 0 | R | 0 | 0 | 0 | B | 0 | G | 0 | R | 0 | 0 | 0  (PIXEL 3 Y 4)
+	
+%endmacro
+
+
+
+
+;------------------------------------------------------------------------------------------------------
+%macro procesar 1
+
+;----------------------------------------------------------------------------------
+	;Calculo si distancia(pixel, coloresParametro) > threshold
+
+	psubq %1, coloresParametro						;Resta de quadwords
+	
+	movdqu xmm6, %1
+	pmullw %1, xmm6									;Elevo al cuadrado y me quedo con la parte baja de los resultados en %1 (creo que con esto alcanza, ver el manual)	
+						
+													;%1 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	phaddw %1, %1									;%1 = B1 + G1 | R1 + 0 | B1 + G1 | R1 + 0 | B2 + G2 | R2 + 0 | B2 + G2 | R2 + 0 
+	phaddw %1, %1									;%1 = B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B2 + G2 + R2 + 0 | B2 + G2+ R2 + 0 | B2 + G2 + R2 + 0| B2 + G2 + R2 + 0 
+													;%1 = B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B2 + G2 + R2 | B2 + G2+ R2 | B2 + G2 + R2 | B2 + G2 + R2  
+	movdqu xmm10, [mascara]
+	pand %1, xmm10									;%1 = B1 + G1 + R1 | 0 | 0 | 0 | B2 + G2 + R2 | 0 | 0 | 0   (cada 0 es un dword en cero)
+	cvtdq2ps %1, %1									;convierto double word a float (con signo, ver si eso la caga despues, creo que no porque cuando desempaquetamos con cero deberian quedar todos positivos)
+													;%1 = B1 + G1 + R1 | 0 | B2 + G2 + R2 | 0
+	
+	movdqu xmm8, %1									;xmm8 = B1 + G1 + R1 | 0 | B2 + G2 + R2 | 0  (copia para usarla despues y no tener que volver a calcular la suma)
+		
+	sqrtps %1, %1									;Calculo las raices cuadradas, %1 =  sqrt(B1 + G1 + R1) | 0 | sqrt(B2 + G2 + R2) | 0
+	
+	roundps %1, %1, 00								;Redondeo al entero mas cercano
+	cvtps2dq %1, %1									;Convierto los floats a double words
+	
+	;Entonces, %1 = resultado de la funcion distancia
+;-------------------------------------------------------------------------------------
+	
+	movdqu xmm6, %1									;Me creo una copia
+	pcmpgtq xmm6, threshold							;Comparo los enteros contra el threshold por > y genero una mascara
+	pand xmm8, xmm6									;xmm8 tiene los colores que son mayores al threshold y el resto en cero
+	movdqu xmm9, [mascaraTodoUno]					;xmm9 = todos los bytes en 1
+	pandn xmm6, xmm9								;Complemento xmm6
+	pand %1, xmm6									;%1 tiene los colores que son menores al threshold y el resto en cero
+	
+	;Actualizo los colores
+	;La suma pixel[0] + pixel[1] + pixel[2] no la tengo que hacer porque ya lo hice cuando calculo la distancia (xmm8)
+	
+	movdqu xmm9, [int3]								;xmm9 = 3 | 0 | 3 | 0 |    (cada numero es un doubleword)
+	cvtdq2ps xmm9, xmm9								;Convierto el 3 a float para hacer la division
+	divps xmm8, xmm9								;xmm8 = pixel[0] + pixel[1] + pixel[2] / 3
+	movdqu xmm9, [int255]							;xmm9 = 255 | 0 | 255 | 0 |   (doublewords)
+	cvtdq2ps xmm9, xmm9								;Convierto el 255 a float para poder usar min
+	minps xmm8, xmm9								;xmm8 = min(255, pre@xmm8) | 0 | min(255, pre@xmm8) | 0 | (floats)
+	
+	paddd %1, xmm8									;xmm1 tiene los colores actualizados
+	cvtps2dq %1, %1									;convierto de floats a ints
+														
+	
+;-------------------------------------------------------------------------------------
+
+	;GUARDARLOS EN DESTINO
+	
+	
+
+%endmacro
+
+
+
+;------------------------------------------------------------------------------------------------------
+
+
+
+section .data
+
+	mascara: db 0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00
+	int3: db 0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+	int255: db 0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00
+	mascaraTodoUno: db 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+	juntar_mask: db 0xFF, 0xFF, 0xFF, 0xFF, 0x0E, 0x0D, 0x0C, 0x0A, 0x09, 0x08, 0x06, 0x05, 0x04, 0x02, 0x01, 0x00
+
+section .text
+
+
+;void color_filter_asm(unsigned char *src,
+;                    unsigned char *dst,
+;                    unsigned char rc,
+;                    unsigned char gc,
+;                    unsigned char bc,
+;                    int threshold,
+;                    int width,
+;                    int height);
+
+color_filter_asm:
+
+	;rdi = src
+	;rsi = dst
+	;dl = rc
+	;cl = gc
+	;r8b = bc
+	;r9d = threshold
+	;[rbp+16] = width
+	;[rbp+24] = height
+	
+	push rbp
+	mov rbp, rsp
+	push r12
+	push r13
+	push r14
+	push r15
+	push rbx
+	sub rsp, 8
+	
+	xor r12, r12
+	xor r13, r13
+	xor r14, r14
+	xor r15, r15
+	xor rbx, rbx
+	
+ 
+	mov r12b, r8b			;ver esta linea creo que esta extendiendo mal r8 o gdb tira fruta cuando quiero ver r8b
+	mov r8, r12
+	mov r12b, cl
+	mov rcx, r12
+	mov r12b, dl
+	mov rdx, r12
+	xor r12, r12
+
+	pxor threshold, threshold
+	movd threshold, r9d				;Cargo el threshold en la parte baja de xmm15. xmm15 = threshold | 0 | 0 | 0 |
+	movlhps threshold, threshold	;Esta no se si sirve porque considera que los datos son floats, y habria que ver si los toca cuando los copia
+	
+	mov r12d, [rbp+16]	;r12d = width
+	mov r13d, [rbp+24]  ;r13d = height
+
+	mov cantBytesImagen, 3
+	imul cantBytesImagen, r12d
+	imul cantBytesImagen, r13d
+
+	mov r9,  0xFFFF050403020100	;parte baja de la máscara para pshufb (1)
+	mov r10, 0xFFFF0B0A09080706	;parte alta de la máscara para pshufb (1)
+
+	movq xmm3, r10
+	pslldq xmm3, 8
+	movq xmm4, r9
+	por xmm3, xmm4			;la máscara para pshufb (1) en xmm3
+
+	mov r9 , 0xFFFF050403020100	;parte baja de la máscara para pshufb (2)
+	mov r10, 0xFFFF0B0A09080706	;parte alta de la máscara para pshufb (2)
+
+	movq xmm4, r10
+	pslldq xmm4, 8
+	movq xmm5, r9
+	por xmm3, xmm4			;la máscara para shufb (2) en xmm4
+	
+	
+;-------------------------------------------------------------------------------------------
+
+	;Cargo los colores que me pasan por parametro
+
+	shl rcx, 2			;Shifteo a izquierda 2 bytes el color verde
+	shl rdx, 4			;Shifteo a izquierda 4 bytes el color rojo
+
+	movq coloresParametro, r8
+	movq xmm6, rcx
+	paddq coloresParametro, xmm6
+	movq xmm6, rdx
+	paddq coloresParametro, xmm6
+	movlhps coloresParametro, coloresParametro	;xmm7 = B | 0 | G | 0 | R | 0 | 0 | 0 | B | 0 | G | 0 | R | 0 | 0 | 0
+
+
+;-----------------------------------------------------------------------------------------------
+
+.ciclo:
+
+	cmp DWORD cantBytesImagen, 0		;Mientras haya bytes para leer...
+	je .fin
+
+	pxor xmm1, xmm1
+	pxor xmm2, xmm2
+	pxor xmm5, xmm5
+	pxor xmm6, xmm6
+	pxor xmm14, xmm14
+
+	movdqu xmm0, [src]					;Levanto 16 bytes (4 pixeles, los ultimos 4 bytes los ignoro)
+	
+	
+
+	pshufb xmm0, xmm3
+
+	movdqu xmm1, xmm0
+	movdqu xmm2, xmm0
+
+	punpcklbw xmm1, xmm5
+	punpckhbw xmm2, xmm5
+
+	pshufb xmm1, xmm3
+	pshufb xmm2, xmm3
+
+	;%2 = B | 0 | G | 0 | R | 0 | 0 | 0 | B | 0 | G | 0 | R | 0 | 0 | 0  (PIXEL 1 Y 2)
+	;%3 = B | 0 | G | 0 | R | 0 | 0 | 0 | B | 0 | G | 0 | R | 0 | 0 | 0  (PIXEL 3 Y 4)	
+	
+
+	
+;PRIMER REGISTRO (DESPUES CUANDO TERMINE PONGO UNA MACRO)
+;----------------------------------------------------------------------------------
+	;Calculo si distancia(pixel, coloresParametro) > threshold
+	movdqu xmm8, xmm1								;xmm8 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	movdqu xmm9, xmm1								;xmm9 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	
+	psubq xmm1, coloresParametro					;Resta de quadwords
+	
+	movdqu xmm6, xmm1
+	pmullw xmm1, xmm6								;Elevo al cuadrado y me quedo con la parte baja de los resultados en xmm1 (creo que con esto alcanza, ver el manual)	
+						
+													;xmm1 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	phaddw xmm1, xmm1								;xmm1 = B1 + G1 | R1 + 0 | B1 + G1 | R1 + 0 | B2 + G2 | R2 + 0 | B2 + G2 | R2 + 0 
+	phaddw xmm1, xmm1								;xmm1 = B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B2 + G2 + R2 + 0 | B2 + G2+ R2 + 0 | B2 + G2 + R2 + 0| B2 + G2 + R2 + 0 
+													;xmm1 = B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B2 + G2 + R2 | B2 + G2+ R2 | B2 + G2 + R2 | B2 + G2 + R2  
+	movdqu xmm10, [mascara]
+	pand xmm1, xmm10								;xmm1 = B1 + G1 + R1 | 0 | 0 | 0 | B2 + G2 + R2 | 0 | 0 | 0   (cada 0 es un dword en cero)
+	cvtdq2ps xmm1, xmm1								;convierto double word a float (con signo, ver si eso la caga despues, creo que no porque cuando desempaquetamos con cero deberian quedar todos positivos)
+													;xmm1 = B1 + G1 + R1 | 0 | B2 + G2 + R2 | 0
+			
+	sqrtps xmm1, xmm1								;Calculo las raices cuadradas, xmm1 =  sqrt(B1 + G1 + R1) | 0 | sqrt(B2 + G2 + R2) | 0
+	
+	roundps xmm1, xmm1, 00							;Redondeo al entero mas cercano
+	cvtps2dq xmm1, xmm1								;Convierto los floats a double words
+	
+	;Entonces, xmm1 = resultado de la funcion distancia
+;-------------------------------------------------------------------------------------
+	
+	;xmm8 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	;xmm9 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	
+	pcmpgtq xmm1, threshold							;Comparo de a qwords contra el threshold por > y genero una mascara
+	pand xmm8, xmm1									;xmm8 tiene los colores que son mayores al threshold y el resto en cero
+	movdqu xmm10, [mascaraTodoUno]					;xmm10 = todos los bytes en 1
+	pand xmm1, xmm10								;Complemento xmm1
+	pand xmm9, xmm1									;xmm9 tiene los colores que son menores al threshold y el resto en cero
+	
+	;Actualizo los colores
+	
+	phaddw xmm8, xmm8
+	phaddw xmm8, xmm8								;xmm8 = B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B2 + G2 + R2 | B2 + G2+ R2 | B2 + G2 + R2 | B2 + G2 + R2  
+	movdqu xmm10, [mascara]
+	pand xmm8, xmm10								;xmm8 = B1 + G1 + R1 | 0 | 0 | 0 | B2 + G2 + R2 | 0 | 0 | 0  (words)
+	
+	movdqu xmm10, [int3]							;xmm10 = 3 | 0 | 3 | 0 |    (cada numero es un doubleword)
+	cvtdq2ps xmm10, xmm10							;Convierto el 3 a float para hacer la division
+	divps xmm8, xmm10								;xmm8 = (pixel[0] + pixel[1] + pixel[2]) / 3
+	movdqu xmm10, [int255]							;xmm10 = 255 | 0 | 255 | 0 |   (doublewords)
+	cvtdq2ps xmm10, xmm10							;Convierto el 255 a float para poder usar min
+	minps xmm8, xmm10								;xmm8 = min(255, pre@xmm8) | 0 | min(255, pre@xmm8) | 0 | (floats)
+													;En realidad en xmm8 va a quedar algo como | * | 0 | 0 | 0 | 0 | 0 | 0 | 0 | * | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+	movdqu xmm10, xmm8
+	psllw xmm10, 2									;shifteo a izquierda 2 bytes
+	paddd xmm8, xmm10								;xmm8 = | * | 0 | * | 0 | 0 | 0 | 0 | 0 | * | 0 | * | 0 | 0 | 0 | 0 | 0 |
+	psllw xmm10, 2 									;shifteo a izquierda 2 bytes
+	paddd xmm8, xmm10								;xmm8 = | * | 0 | * | 0 | * | 0 | 0 | 0 | * | 0 | * | 0 | * | 0 | 0 | 0 |
+								 
+	pxor xmm1, xmm1
+	paddd xmm1, xmm8
+	paddd xmm1, xmm9								;xmm1 tiene los colores actualizados
+	cvtps2dq xmm1, xmm1								;convierto de floats a ints
+														
+	
+	
+	
+;SEGUNDO REGISTRO (DESPUES CUANDO TERMINE PONGO UNA MACRO)
+;----------------------------------------------------------------------------------
+	;Calculo si distancia(pixel, coloresParametro) > threshold
+	movdqu xmm8, xmm2								;xmm8 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	movdqu xmm9, xmm2								;xmm9 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	
+	psubq xmm2, coloresParametro					;Resta de quadwords
+	
+	movdqu xmm6, xmm2
+	pmullw xmm2, xmm6								;Elevo al cuadrado y me quedo con la parte baja de los resultados en xmm2(creo que con esto alcanza, ver el manual)	
+						
+													;xmm2 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	phaddw xmm2, xmm2								;xmm2 = B1 + G1 | R1 + 0 | B1 + G1 | R1 + 0 | B2 + G2 | R2 + 0 | B2 + G2 | R2 + 0 
+	phaddw xmm2, xmm2								;xmm2 = B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B1 + G1 + R1 + 0 | B2 + G2 + R2 + 0 | B2 + G2+ R2 + 0 | B2 + G2 + R2 + 0| B2 + G2 + R2 + 0 
+													;xmm2 = B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B2 + G2 + R2 | B2 + G2+ R2 | B2 + G2 + R2 | B2 + G2 + R2  
+	movdqu xmm10, [mascara]
+	pand xmm2, xmm10								;xmm2 = B1 + G1 + R1 | 0 | 0 | 0 | B2 + G2 + R2 | 0 | 0 | 0   (cada 0 es un dword en cero)
+	cvtdq2ps xmm2, xmm2								;convierto double word a float (con signo, ver si eso la caga despues, creo que no porque cuando desempaquetamos con cero deberian quedar todos positivos)
+													;xmm2 = B1 + G1 + R1 | 0 | B2 + G2 + R2 | 0
+			
+	sqrtps xmm2, xmm2								;Calculo las raices cuadradas, xmm2 =  sqrt(B1 + G1 + R1) | 0 | sqrt(B2 + G2 + R2) | 0
+	
+	roundps xmm2, xmm2, 00							;Redondeo al entero mas cercano
+	cvtps2dq xmm2, xmm2								;Convierto los floats a double words
+	
+	;Entonces, xmm2 = resultado de la funcion distancia
+;-------------------------------------------------------------------------------------
+	
+	;xmm8 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	;xmm9 = B1 | 0 | G1 | 0 | R1 | 0 | 0 | 0 | B2 | 0 | G2 | 0 | R2 | 0 | 0 | 0
+	
+	pcmpgtq xmm2, threshold							;Comparo de a qwords contra el threshold por > y genero una mascara
+	pand xmm8, xmm2									;xmm8 tiene los colores que son mayores al threshold y el resto en cero
+	movdqu xmm10, [mascaraTodoUno]					;xmm10 = todos los bytes en 1
+	pand xmm2, xmm10								;Complemento xmm1
+	pand xmm9, xmm2									;xmm9 tiene los colores que son menores al threshold y el resto en cero
+	
+	;Actualizo los colores
+	
+	phaddw xmm8, xmm8								;sumo horizontalmente
+	phaddw xmm8, xmm8								;xmm8 = B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B1 + G1 + R1 | B2 + G2 + R2 | B2 + G2+ R2 | B2 + G2 + R2 | B2 + G2 + R2  
+	movdqu xmm10, [mascara]
+	pand xmm8, xmm10								;xmm8 = B1 + G1 + R1 | 0 | 0 | 0 | B2 + G2 + R2 | 0 | 0 | 0  (words)
+	
+	movdqu xmm10, [int3]							;xmm10 = 3 | 0 | 3 | 0 |    (cada numero es un doubleword)
+	cvtdq2ps xmm10, xmm10							;Convierto el 3 a float para hacer la division
+	divps xmm8, xmm10								;xmm8 = (pixel[0] + pixel[1] + pixel[2]) / 3
+	movdqu xmm10, [int255]							;xmm10 = 255 | 0 | 255 | 0 |   (doublewords)
+	cvtdq2ps xmm10, xmm10							;Convierto el 255 a float para poder usar min
+	minps xmm8, xmm10								;xmm8 = min(255, pre@xmm8) | 0 | min(255, pre@xmm8) | 0 | (floats)
+													;En realidad en xmm8 va a quedar algo como | * | 0 | 0 | 0 | 0 | 0 | 0 | 0 | * | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+	movdqu xmm10, xmm8
+	psllw xmm10, 2									;shifteo a izquierda 2 bytes
+	paddd xmm8, xmm10								;xmm8 = | * | 0 | * | 0 | 0 | 0 | 0 | 0 | * | 0 | * | 0 | 0 | 0 | 0 | 0 |
+	psllw xmm10, 2									;shifteo a izquierda 2 bytes
+	paddd xmm8, xmm10								;xmm8 = | * | 0 | * | 0 | * | 0 | 0 | 0 | * | 0 | * | 0 | * | 0 | 0 | 0 |
+								 
+	
+	pxor xmm2, xmm2
+	paddd xmm2, xmm8
+	paddd xmm2, xmm9								;xmm1 tiene los colores actualizados
+	cvtps2dq xmm2, xmm2								;convierto de floats a ints
+														
+	
+	
+; EMPAQUETAR Y GUARDARLOS EN DST
+	
+	
+	packuswb xmm1, xmm2
+	movdqu xmm6, [juntar_mask]
+	pshufb xmm1, xmm6
+	
+	movdqu [dst],xmm1
+	
+	add src, 12	
+	add dst, 12									;
+	sub cantBytesImagen, 12
+
+	
+	jmp .ciclo
+	
+	
+;-----------------------------------------------------------------------------------
+	
+.fin: 
+	
+	add rsp, 8
+	pop rbx
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbp
+	
+    ret

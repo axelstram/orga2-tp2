@@ -1,0 +1,3 @@
+decode shiryu
+ASM:	9364433 
+ASM SP:	9247420 
